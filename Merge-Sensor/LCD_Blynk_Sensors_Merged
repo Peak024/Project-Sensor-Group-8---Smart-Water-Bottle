@@ -1,0 +1,263 @@
+#define BLYNK_TEMPLATE_ID "TMPL6lEA4Vlel"
+#define BLYNK_TEMPLATE_NAME "Ftds"
+#define BLYNK_AUTH_TOKEN "LqTPxIa_BfZ3sTMHE7bf5mMBcfCzqoU7"
+
+#define BLYNK_PRINT Serial
+
+#include <WiFi.h>
+#include <BlynkSimpleEsp32.h>
+#include "HX711.h"
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_ST7789.h>
+#include <SPI.h>
+#include <math.h>
+
+// ================= WiFi =================
+char ssid[] = "sukrist";
+char pass[] = "Tippabust24";
+char auth[] = BLYNK_AUTH_TOKEN;
+
+// ================= HX711 =================
+#define DOUT 33
+#define CLK  32
+float calibration_factor = 448.49;
+HX711 scale;
+
+// ================= DS18B20 =================
+#define ONE_WIRE_BUS_PIN 22
+OneWire oneWire(ONE_WIRE_BUS_PIN);
+DallasTemperature sensors(&oneWire);
+
+// ================= TDS =================
+#define TDS_PIN 34
+#define VREF 3.3
+#define ADC_RESOLUTION 4095.0
+#define SCOUNT 10
+
+int analogBuffer[SCOUNT];
+int analogBufferTemp[SCOUNT];
+int analogBufferIndex = 0;
+
+// ================= TFT =================
+#define TFT_DC   2
+#define TFT_RST  4
+#define TFT_CS  -1
+Adafruit_ST7789 tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_RST);
+
+// ================= Variables =================
+float lastVolume = -999;
+float lastTemp   = -999;
+float lastTDS    = -999;
+float lastEC     = -999;
+
+float averageVoltage = 0;
+float tdsValue = 0;
+float ecValue = 0;
+
+BlynkTimer timer;
+
+// =====================================================
+// ================= MEDIAN FILTER =====================
+// =====================================================
+
+int getMedianNum(int bArray[], int iFilterLen){
+  int bTab[iFilterLen];
+  for (byte i = 0; i<iFilterLen; i++)
+    bTab[i] = bArray[i];
+
+  int i, j, bTemp;
+  for (j = 0; j < iFilterLen - 1; j++) {
+    for (i = 0; i < iFilterLen - j - 1; i++) {
+      if (bTab[i] > bTab[i + 1]) {
+        bTemp = bTab[i];
+        bTab[i] = bTab[i + 1];
+        bTab[i + 1] = bTemp;
+      }
+    }
+  }
+
+  if ((iFilterLen & 1) > 0)
+    bTemp = bTab[(iFilterLen - 1) / 2];
+  else
+    bTemp = (bTab[iFilterLen / 2] + bTab[iFilterLen / 2 - 1]) / 2;
+
+  return bTemp;
+}
+
+// =====================================================
+// ================= SENSOR FUNCTION ===================
+// =====================================================
+
+void readAllSensors() {
+
+  // ===== Weight → Volume =====
+  float weight = scale.get_units(5) / 1000.0;
+  float volume_ml = weight * 1000.0;
+
+  // ===== Temperature =====
+  sensors.requestTemperatures();
+  float tempC = sensors.getTempCByIndex(0);
+
+  // ===== TDS Sampling =====
+  analogBuffer[analogBufferIndex] = analogRead(TDS_PIN);
+  analogBufferIndex++;
+  if (analogBufferIndex == SCOUNT)
+    analogBufferIndex = 0;
+
+  for (int i = 0; i < SCOUNT; i++)
+    analogBufferTemp[i] = analogBuffer[i];
+
+  int medianADC = getMedianNum(analogBufferTemp, SCOUNT);
+
+  averageVoltage = medianADC * (float)VREF / ADC_RESOLUTION;
+
+  float compensationCoefficient = 1.0 + 0.02 * (tempC - 25.0);
+  float compensationVoltage = averageVoltage / compensationCoefficient;
+
+  // ===== EC (Voltage based) =====
+  ecValue = compensationVoltage;
+
+  // ===== TDS (with 2.12 factor) =====
+  tdsValue = (133.42 * pow(compensationVoltage, 3)
+             -255.86 * pow(compensationVoltage, 2)
+             +857.39 * compensationVoltage) * 2.12 * 0.5;
+
+  if (tdsValue < 0) tdsValue = 0;
+
+  float tds = tdsValue;
+  float ec  = ecValue;
+
+  // ===== Serial Monitor =====
+  Serial.print("Vol: ");
+  Serial.print(volume_ml);
+  Serial.print(" | Temp: ");
+  Serial.print(tempC);
+  Serial.print(" | TDS: ");
+  Serial.print(tds);
+  Serial.print(" | EC: ");
+  Serial.println(ec, 3);
+
+  // =====================================================
+  // ================= TFT UPDATE ========================
+  // =====================================================
+
+  // -------- VOLUME --------
+  if (abs(volume_ml - lastVolume) > 1) {
+    lastVolume = volume_ml;
+    char buf[20];
+    sprintf(buf, "%.0f mL", volume_ml);
+    tft.fillRect(100, 40, 140, 30, ST77XX_BLACK);
+    tft.setTextSize(2);
+    tft.setTextColor(ST77XX_YELLOW);
+    tft.setCursor(110, 50);
+    tft.print(buf);
+  }
+
+  // -------- TEMP --------
+  if (abs(tempC - lastTemp) > 0.1) {
+    lastTemp = tempC;
+    char buf2[20];
+    sprintf(buf2, "%.1f C", tempC);
+    tft.fillRect(100, 90, 140, 30, ST77XX_BLACK);
+    tft.setTextColor(ST77XX_CYAN);
+    tft.setCursor(110, 100);
+    tft.print(buf2);
+  }
+
+  // -------- TDS --------
+  if (abs(tds - lastTDS) > 5) {
+    lastTDS = tds;
+    char buf3[20];
+    sprintf(buf3, "%.0f ppm", tds);
+    tft.fillRect(100, 140, 140, 30, ST77XX_BLACK);
+    tft.setTextColor(ST77XX_GREEN);
+    tft.setCursor(110, 150);
+    tft.print(buf3);
+  }
+
+  // -------- EC --------
+  if (abs(ec - lastEC) > 0.01) {
+    lastEC = ec;
+    char buf4[20];
+    sprintf(buf4, "%.3f", ec);
+    tft.fillRect(100, 190, 140, 30, ST77XX_BLACK);
+    tft.setTextColor(ST77XX_MAGENTA);
+    tft.setCursor(110, 200);
+    tft.print(buf4);
+  }
+
+  // ===== Send to Blynk =====
+  if (Blynk.connected()) {
+    Blynk.virtualWrite(V0, volume_ml);
+    Blynk.virtualWrite(V1, tempC);
+    Blynk.virtualWrite(V2, tds);
+    Blynk.virtualWrite(V3, ec);
+  }
+}
+
+// =====================================================
+// ================= CONNECTION CHECK ==================
+// =====================================================
+
+void checkConnection() {
+
+  if (WiFi.status() != WL_CONNECTED) {
+    WiFi.begin(ssid, pass);
+  }
+
+  if (!Blynk.connected()) {
+    Blynk.connect();
+  }
+}
+
+// =====================================================
+// ===================== SETUP =========================
+// =====================================================
+
+void setup() {
+
+  Serial.begin(115200);
+
+  analogReadResolution(12);
+
+  Blynk.begin(auth, ssid, pass);
+
+  scale.begin(DOUT, CLK);
+  scale.set_scale(calibration_factor);
+  scale.tare(1000);
+
+  sensors.begin();
+
+  tft.init(240, 240, SPI_MODE3);
+  tft.setRotation(2);
+  tft.fillScreen(ST77XX_BLACK);
+
+  tft.setTextSize(2);
+  tft.setTextColor(ST77XX_WHITE);
+
+  tft.setCursor(20, 50);
+  tft.println("Volume");
+
+  tft.setCursor(20, 100);
+  tft.println("Temp");
+
+  tft.setCursor(20, 150);
+  tft.println("TDS");
+
+  tft.setCursor(20, 200);
+  tft.println("EC");
+
+  timer.setInterval(2000L, readAllSensors);
+  timer.setInterval(10000L, checkConnection);
+}
+
+// =====================================================
+// ===================== LOOP ==========================
+// =====================================================
+
+void loop() {
+  Blynk.run();
+  timer.run();
+}
