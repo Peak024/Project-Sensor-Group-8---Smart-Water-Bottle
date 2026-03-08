@@ -1,0 +1,365 @@
+#define BLYNK_TEMPLATE_ID "TMPL6lEA4Vlel"
+#define BLYNK_TEMPLATE_NAME "Ftds"
+#define BLYNK_AUTH_TOKEN "LqTPxIa_BfZ3sTMHE7bf5mMBcfCzqoU7"
+
+#define BLYNK_PRINT Serial
+
+#include <WiFi.h>
+#include <BlynkSimpleEsp32.h>
+#include "HX711.h"
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_ST7789.h>
+#include <SPI.h>
+#include <math.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+#include <time.h>
+
+// ================= WIFI =================
+char ssid[] = "2.4GTripleY2521";
+char pass[] = "0845195595";
+
+// ================= LINE =================
+String LINE_TOKEN = "SN2FkgQkfkbmbLxQHEomvxEIayWXzLUAr5SmsAZt5ysQH1qvB3QYDZTPhqdOwvpOvL0prI6eniQri9QCG2++HI4kQhbs+mSK03mNWQC/Ghxj75CleEdOIJS/dkbV/CSEELHHzjS3XIT9S/EDGuGeMwdB04t89/1O/w1cDnyilFU=";
+String LINE_USER_ID = "Ub4e23107d2139781948210c4ff66233e";
+
+// ================= HX711 =================
+#define DOUT 33
+#define CLK 32
+HX711 scale;
+float calibration_factor = 448.49;
+
+// ================= TEMP =================
+#define ONE_WIRE_BUS_PIN 22
+OneWire oneWire(ONE_WIRE_BUS_PIN);
+DallasTemperature sensors(&oneWire);
+
+// ================= TDS =================
+#define TDS_PIN 34
+#define VREF 3.3
+#define ADC_RESOLUTION 4095.0
+#define SCOUNT 10
+
+int analogBuffer[SCOUNT];
+int analogBufferTemp[SCOUNT];
+int analogBufferIndex = 0;
+
+// ================= TFT =================
+#define TFT_DC 2
+#define TFT_RST 4
+#define TFT_CS -1
+Adafruit_ST7789 tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_RST);
+
+// ================= VARIABLES =================
+float previousVolume = 0;
+float dailyDrink = 0;
+bool firstRead = true;
+
+float tdsValue = 0;
+float ecValue = 0;
+float averageVoltage = 0;
+
+float lastVolume = -999;
+float lastTemp   = -999;
+float lastTDS    = -999;
+float lastEC     = -999;
+float lastDrink  = -999;
+
+// ===== DAILY GOAL =====
+float dailyGoal = 2000;
+bool goalReached = false;
+
+// ===== REMINDER =====
+unsigned long lastReminder = 0;
+const unsigned long reminderInterval = 600000; //  50 seconds
+
+// ===== RESET =====
+int lastResetDay = -1;
+
+BlynkTimer timer;
+
+// ================= MEDIAN FILTER =================
+int getMedianNum(int bArray[], int iFilterLen)
+{
+  int bTab[iFilterLen];
+
+  for(byte i=0;i<iFilterLen;i++)
+    bTab[i]=bArray[i];
+
+  int i,j,bTemp;
+
+  for(j=0;j<iFilterLen-1;j++)
+  {
+    for(i=0;i<iFilterLen-j-1;i++)
+    {
+      if(bTab[i]>bTab[i+1])
+      {
+        bTemp=bTab[i];
+        bTab[i]=bTab[i+1];
+        bTab[i+1]=bTemp;
+      }
+    }
+  }
+
+  if((iFilterLen & 1)>0)
+    bTemp=bTab[(iFilterLen-1)/2];
+  else
+    bTemp=(bTab[iFilterLen/2]+bTab[iFilterLen/2-1])/2;
+
+  return bTemp;
+}
+
+// ================= LINE SEND =================
+void sendLine(String message)
+{
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  WiFiClientSecure client;
+  client.setInsecure();
+
+  HTTPClient https;
+
+  message.replace("\n","\\n");
+
+  if (https.begin(client,"https://api.line.me/v2/bot/message/push"))
+  {
+    https.addHeader("Content-Type","application/json");
+    https.addHeader("Authorization","Bearer "+LINE_TOKEN);
+
+    String payload =
+    "{\"to\":\""+LINE_USER_ID+"\",\"messages\":[{\"type\":\"text\",\"text\":\""+message+"\"}]}";
+
+    https.POST(payload);
+    https.end();
+  }
+}
+
+// ================= TFT UPDATE =================
+void updateTFT(float volume,float temp,float tds,float ec,float drink)
+{
+
+  if (abs(volume - lastVolume) > 1) {
+    lastVolume = volume;
+    char buf[20];
+    sprintf(buf, "%.0f ml", volume);
+    tft.fillRect(120,40,120,30,ST77XX_BLACK);
+    tft.setTextColor(ST77XX_YELLOW);
+    tft.setCursor(120,50);
+    tft.print(buf);
+  }
+
+  if (abs(temp - lastTemp) > 0.1) {
+    lastTemp = temp;
+    char buf[20];
+    sprintf(buf,"%.1f C",temp);
+    tft.fillRect(120,80,120,30,ST77XX_BLACK);
+    tft.setTextColor(ST77XX_CYAN);
+    tft.setCursor(120,90);
+    tft.print(buf);
+  }
+
+  if (abs(tds - lastTDS) > 5) {
+    lastTDS = tds;
+    char buf[20];
+    sprintf(buf,"%.0f ppm",tds);
+    tft.fillRect(120,120,120,30,ST77XX_BLACK);
+    tft.setTextColor(ST77XX_GREEN);
+    tft.setCursor(120,130);
+    tft.print(buf);
+  }
+
+  if (abs(ec - lastEC) > 0.01) {
+    lastEC = ec;
+    char buf[20];
+    sprintf(buf,"%.3f",ec);
+    tft.fillRect(120,160,120,30,ST77XX_BLACK);
+    tft.setTextColor(ST77XX_MAGENTA);
+    tft.setCursor(120,170);
+    tft.print(buf);
+  }
+
+  if (abs(drink - lastDrink) > 5) {
+    lastDrink = drink;
+    char buf[20];
+    sprintf(buf,"%.0f ml",drink);
+    tft.fillRect(120,200,120,30,ST77XX_BLACK);
+    tft.setTextColor(ST77XX_ORANGE);
+    tft.setCursor(120,210);
+    tft.print(buf);
+  }
+}
+
+// ================= RESET DAILY =================
+void checkDailyReset()
+{
+  struct tm timeinfo;
+
+  if(!getLocalTime(&timeinfo)) return;
+
+  int currentDay = timeinfo.tm_mday;
+
+  if(currentDay != lastResetDay)
+  {
+    dailyDrink = 0;
+    goalReached = false;
+    lastResetDay = currentDay;
+
+    sendLine("New day started. Daily intake reset.");
+  }
+}
+
+// ================= REMINDER =================
+void drinkReminder()
+{
+  if(millis() - lastReminder > reminderInterval)
+  {
+    if(dailyDrink < dailyGoal)
+    {
+      float remain = dailyGoal - dailyDrink;
+
+      sendLine(
+      "Water Reminder\n"
+      "Drank: " + String(dailyDrink,0) + " ml\n"
+      "Remaining: " + String(remain,0) + " ml");
+    }
+    else if(!goalReached)
+    {
+      sendLine("Congratulations! You reached today's water goal.");
+      goalReached = true;
+    }
+
+    lastReminder = millis();
+  }
+}
+
+// ================= SENSOR =================
+void readSensors()
+{
+
+  float weight = scale.get_units(5)/1000.0;
+  float volume = weight*1000.0;
+
+  sensors.requestTemperatures();
+  float temp = sensors.getTempCByIndex(0);
+
+  // ===== TDS =====
+  analogBuffer[analogBufferIndex] = analogRead(TDS_PIN);
+  analogBufferIndex++;
+
+  if(analogBufferIndex == SCOUNT)
+    analogBufferIndex = 0;
+
+  for(int i=0;i<SCOUNT;i++)
+    analogBufferTemp[i] = analogBuffer[i];
+
+  int medianADC = getMedianNum(analogBufferTemp,SCOUNT);
+
+  averageVoltage = medianADC * VREF / ADC_RESOLUTION;
+
+  float compensationCoefficient = 1.0 + 0.02 * (temp - 25.0);
+  float compensationVoltage = averageVoltage / compensationCoefficient;
+
+  ecValue = compensationVoltage;
+
+  tdsValue = (133.42*pow(compensationVoltage,3)
+            -255.86*pow(compensationVoltage,2)
+            +857.39*compensationVoltage)*0.5;
+
+  if(volume < 0) volume = 0;
+  if(temp < 0) temp = 0;
+  if(tdsValue < 0) tdsValue = 0;
+  if(ecValue < 0) ecValue = 0;
+  
+  // ===== FIRST CONNECT =====
+  if(firstRead)
+  {
+    previousVolume = volume;
+    firstRead = false;
+    delay(10000);
+    sendLine("ESP32 Connected");
+  }
+
+  // ===== DRINK DETECT =====
+  if(previousVolume - volume > 30)
+  {
+    float drink = previousVolume - volume;
+    dailyDrink += drink;
+
+    sendLine("You drank "+String(drink)+" ml");
+  }
+
+  previousVolume = volume;
+
+  Serial.print("Volume:");
+  Serial.print(volume);
+  Serial.print(" Temp:");
+  Serial.print(temp);
+  Serial.print(" TDS:");
+  Serial.print(tdsValue);
+  Serial.print(" EC:");
+  Serial.print(ecValue);
+  Serial.print(" Drink:");
+  Serial.println(dailyDrink);
+
+  updateTFT(volume,temp,tdsValue,ecValue,dailyDrink);
+
+  Blynk.virtualWrite(V0,volume);
+  Blynk.virtualWrite(V1,temp);
+  Blynk.virtualWrite(V2,tdsValue);
+  Blynk.virtualWrite(V3,ecValue);
+  Blynk.virtualWrite(V4,dailyDrink);
+}
+
+// ================= SETUP =================
+void setup()
+{
+  Serial.begin(115200);
+
+  WiFi.begin(ssid,pass);
+
+  configTime(7 * 3600, 0, "pool.ntp.org");
+
+  Blynk.config(BLYNK_AUTH_TOKEN);
+
+  scale.begin(DOUT,CLK);
+  scale.set_scale(calibration_factor);
+  scale.tare();
+
+  sensors.begin();
+
+  tft.init(240,240,SPI_MODE3);
+  tft.setRotation(2);
+  tft.fillScreen(ST77XX_BLACK);
+
+  tft.setTextSize(2);
+  tft.setTextColor(ST77XX_WHITE);
+
+  tft.setCursor(20,50);
+  tft.println("Volume");
+
+  tft.setCursor(20,90);
+  tft.println("Temp");
+
+  tft.setCursor(20,130);
+  tft.println("TDS");
+
+  tft.setCursor(20,170);
+  tft.println("EC");
+
+  tft.setCursor(20,210);
+  tft.println("Intake");
+
+  timer.setInterval(2000L,readSensors);
+}
+
+// ================= LOOP =================
+void loop()
+{
+  Blynk.run();
+  timer.run();
+
+  checkDailyReset();
+  drinkReminder();
+}
